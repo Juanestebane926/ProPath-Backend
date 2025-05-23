@@ -1,196 +1,475 @@
-name: Build, Push, and Deploy Changed Microservices to EKS
+name: Build and deploy ProPath to AKS
 
 on:
   push:
-    branches:
-      - main # Or your deployment branch
+    branches: ["main"]
+  workflow_dispatch:
 
 env:
-  AWS_REGION: tu-region-aws # Replace with your AWS region, e.g., us-east-1
-  EKS_CLUSTER_NAME: tu-nombre-de-cluster-eks # Replace with your EKS cluster name
-  ECR_REGISTRY_ACCOUNT_ID: TU_ID_DE_CUENTA_AWS # Replace with your AWS Account ID, e.g., 123456789012
-  # The ECR_REGISTRY_URI will be dynamically constructed as ${{ env.ECR_REGISTRY_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
-  K8S_NAMESPACE: default # Specify the Kubernetes namespace for deployment
+  NAMESPACE: "propath"  # Solo esto puede quedar público
 
 jobs:
-  build-and-deploy:
-    name: Build and Deploy Changed Services
-    runs-on: ubuntu-latest
+  deploy:
     permissions:
-      contents: read      # Required to checkout the code
-      id-token: write    # Required for OIDC authentication with AWS
-      packages: write    # Required if you were to interact with GitHub Packages (ECR is used here)
-
+      actions: read
+      contents: read
+      id-token: write
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+
+      - name: Azure login
+        uses: azure/login@v1.4.6
         with:
-          fetch-depth: 0 # Important: Fetches all history for all branches and tags, necessary for 'git diff' across commits
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Configure AWS credentials using OIDC
-        uses: aws-actions/configure-aws-credentials@v4
+      - name: Set up kubelogin for non-interactive login
+        uses: azure/use-kubelogin@v1
         with:
-          role-to-assume: arn:aws:iam::${{ env.ECR_REGISTRY_ACCOUNT_ID }}:role/tu-rol-para-github-actions # Replace with the ARN of your IAM role for GitHub Actions
-          aws-region: ${{ env.AWS_REGION }}
+          kubelogin-version: 'v0.0.25'
 
-      - name: Login to Amazon ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
+      - name: Get K8s context
+        uses: azure/aks-set-context@v3
+        with:
+          resource-group: ${{ secrets.RESOURCE_GROUP }}
+          cluster-name: ${{ secrets.CLUSTER_NAME }}
+          admin: 'false'
+          use-kubelogin: 'true'
 
-      - name: Configure Kubectl for EKS
+      - name: Create namespace
         run: |
-          aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
-          echo "Verifying kubectl version and connection:"
-          kubectl version --short --client
-          kubectl get svc # A simple command to test cluster connectivity
+          kubectl create namespace ${{ env.NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
 
-      - name: Get changed files in the push
-        id: changed-files
+      - name: Create secrets
         run: |
-          echo "Getting changed files between previous commit (${{ github.event.before }}) and current commit (${{ github.sha }})"
-          # Ensure github.event.before is not null (e.g., first push to a new branch)
-          if [ "${{ github.event.before }}" = "0000000000000000000000000000000000000000" ]; then
-            echo "Initial push or new branch, considering all microservice files as changed."
-            # List all files in potential microservice directories
-            # This will trigger a build for all services on the first push
-            find . -maxdepth 2 -type f -path '*/Dockerfile' -printf '%h\n' | while read -r dir; do
-              find "$dir" -type f >> files.txt
-            done
-          else
-            git diff --name-only ${{ github.event.before }} ${{ github.sha }} > files.txt
-          fi
-          
-          echo "--- Changed Files in Push ---"
-          cat files.txt
-          echo "-----------------------------"
-          # Prepare output for subsequent steps
-          echo "changed_files_output<<EOF" >> $GITHUB_OUTPUT
-          cat files.txt >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+          kubectl create secret generic propath-secrets \
+            --from-literal=postgres-password="${{ secrets.POSTGRES_PASSWORD }}" \
+            --from-literal=jwt-secret="${{ secrets.JWT_SECRET }}" \
+            --from-literal=jwt-refresh-secret="${{ secrets.JWT_REFRESH_SECRET }}" \
+            --from-literal=gemini-api-key="${{ secrets.GEMINI_API_KEY }}" \
+            --from-literal=smtp-pass="${{ secrets.SMTP_PASS }}" \
+            --namespace=${{ env.NAMESPACE }} \
+            --dry-run=client -o yaml | kubectl apply -f -
 
-      - name: Build, Push, and Deploy Iterating Through Services
-        env:
-          ECR_REGISTRY_URI: ${{ steps.login-ecr.outputs.registry }} # Full ECR registry URI from login step
+      - name: Deploy PostgreSQL
         run: |
-          CHANGED_FILES_CONTENT="${{ steps.changed-files.outputs.changed_files_output }}"
-          IMAGE_TAG=$(echo $GITHUB_SHA | cut -c1-8) # Use the short SHA of the commit as the image tag
-          ANY_SERVICE_PROCESSED=false
+          cat <<EOF | kubectl apply -f -
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: postgres-pvc
+            namespace: ${{ env.NAMESPACE }}
+          spec:
+            accessModes:
+              - ReadWriteOnce
+            resources:
+              requests:
+                storage: 10Gi
+          ---
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: postgres
+            namespace: ${{ env.NAMESPACE }}
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: postgres
+            template:
+              metadata:
+                labels:
+                  app: postgres
+              spec:
+                containers:
+                - name: postgres
+                  image: postgres:14
+                  ports:
+                  - containerPort: 5432
+                  env:
+                  - name: POSTGRES_USER
+                    value: "propath"
+                  - name: POSTGRES_PASSWORD
+                    valueFrom:
+                      secretKeyRef:
+                        name: propath-secrets
+                        key: postgres-password
+                  - name: POSTGRES_DB
+                    value: "propath_db"
+                  volumeMounts:
+                  - name: postgres-storage
+                    mountPath: /var/lib/postgresql/data
+                volumes:
+                - name: postgres-storage
+                  persistentVolumeClaim:
+                    claimName: postgres-pvc
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: postgres
+            namespace: ${{ env.NAMESPACE }}
+          spec:
+            selector:
+              app: postgres
+            ports:
+            - port: 5432
+              targetPort: 5432
+          EOF
 
-          echo "Iterating through potential microservice directories..."
-          echo "Changed files content to check against: "
-          echo "${CHANGED_FILES_CONTENT}"
-          echo "-------------------------------------"
+      - name: Deploy microservices
+        run: |
+          cat <<EOF | kubectl apply -f -
+          # Path Management Service
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: path-management
+            namespace: ${{ env.NAMESPACE }}
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: path-management
+            template:
+              metadata:
+                labels:
+                  app: path-management
+              spec:
+                containers:
+                - name: path-management
+                  image: notkuello/propath-backend-path-management:latest
+                  ports:
+                  - containerPort: 3001
+                  env:
+                  - name: PORT
+                    value: "3001"
+                  - name: HOST
+                    value: "0.0.0.0"
+                  - name: DB_HOST
+                    value: "postgres"
+                  - name: DB_PORT
+                    value: "5432"
+                  - name: DB_USERNAME
+                    value: "propath"
+                  - name: DB_PASSWORD
+                    valueFrom:
+                      secretKeyRef:
+                        name: propath-secrets
+                        key: postgres-password
+                  - name: DB_NAME
+                    value: "propath_db"
+                  - name: DB_SYNC
+                    value: "true"
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: path-management
+            namespace: ${{ env.NAMESPACE }}
+          spec:
+            selector:
+              app: path-management
+            ports:
+            - port: 3001
+              targetPort: 3001
+          ---
+          # Auth Service
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: auth-service
+            namespace: ${{ env.NAMESPACE }}
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: auth-service
+            template:
+              metadata:
+                labels:
+                  app: auth-service
+              spec:
+                containers:
+                - name: auth-service
+                  image: notkuello/propath-backend-auth-service:latest
+                  ports:
+                  - containerPort: 3002
+                  env:
+                  - name: PORT
+                    value: "3002"
+                  - name: HOST
+                    value: "0.0.0.0"
+                  - name: DB_HOST
+                    value: "postgres"
+                  - name: DB_PORT
+                    value: "5432"
+                  - name: DB_USERNAME
+                    value: "propath"
+                  - name: DB_PASSWORD
+                    valueFrom:
+                      secretKeyRef:
+                        name: propath-secrets
+                        key: postgres-password
+                  - name: DB_NAME
+                    value: "propath_db"
+                  - name: DB_SYNC
+                    value: "true"
+                  - name: JWT_SECRET
+                    valueFrom:
+                      secretKeyRef:
+                        name: propath-secrets
+                        key: jwt-secret
+                  - name: JWT_REFRESH_SECRET
+                    valueFrom:
+                      secretKeyRef:
+                        name: propath-secrets
+                        key: jwt-refresh-secret
+                  - name: JWT_EXPIRATION
+                    value: "7d"
+                  - name: JWT_REFRESH_EXPIRATION
+                    value: "10d"
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: auth-service
+            namespace: ${{ env.NAMESPACE }}
+          spec:
+            selector:
+              app: auth-service
+            ports:
+            - port: 3002
+              targetPort: 3002
+          ---
+          # User Management Service
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: user-management
+            namespace: ${{ env.NAMESPACE }}
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: user-management
+            template:
+              metadata:
+                labels:
+                  app: user-management
+              spec:
+                containers:
+                - name: user-management
+                  image: notkuello/propath-backend-user-management:latest
+                  ports:
+                  - containerPort: 3003
+                  env:
+                  - name: PORT
+                    value: "3003"
+                  - name: HOST
+                    value: "0.0.0.0"
+                  - name: DB_HOST
+                    value: "postgres"
+                  - name: DB_PORT
+                    value: "5432"
+                  - name: DB_USERNAME
+                    value: "propath"
+                  - name: DB_PASSWORD
+                    valueFrom:
+                      secretKeyRef:
+                        name: propath-secrets
+                        key: postgres-password
+                  - name: DB_NAME
+                    value: "propath_db"
+                  - name: DB_SYNC
+                    value: "true"
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: user-management
+            namespace: ${{ env.NAMESPACE }}
+          spec:
+            selector:
+              app: user-management
+            ports:
+            - port: 3003
+              targetPort: 3003
+          ---
+          # AI Service
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: ai-service
+            namespace: ${{ env.NAMESPACE }}
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: ai-service
+            template:
+              metadata:
+                labels:
+                  app: ai-service
+              spec:
+                containers:
+                - name: ai-service
+                  image: notkuello/propath-backend-ai-service:latest
+                  ports:
+                  - containerPort: 3004
+                  env:
+                  - name: HOST
+                    value: "0.0.0.0"
+                  - name: PORT
+                    value: "3004"
+                  - name: GEMINI_API_KEY
+                    valueFrom:
+                      secretKeyRef:
+                        name: propath-secrets
+                        key: gemini-api-key
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: ai-service
+            namespace: ${{ env.NAMESPACE }}
+          spec:
+            selector:
+              app: ai-service
+            ports:
+            - port: 3004
+              targetPort: 3004
+          ---
+          # SMTP Service
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: smtp-service
+            namespace: ${{ env.NAMESPACE }}
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: smtp-service
+            template:
+              metadata:
+                labels:
+                  app: smtp-service
+              spec:
+                containers:
+                - name: smtp-service
+                  image: notkuello/propath-backend-smtp-service:latest
+                  ports:
+                  - containerPort: 3005
+                  env:
+                  - name: HOST
+                    value: "0.0.0.0"
+                  - name: PORT
+                    value: "3005"
+                  - name: SMTP_HOST
+                    value: "smtp.gmail.com"
+                  - name: SMTP_PORT
+                    value: "587"
+                  - name: SMTP_USER
+                    value: ${{ secrets.SMTP_USER }}
+                  - name: SMTP_PASS
+                    valueFrom:
+                      secretKeyRef:
+                        name: propath-secrets
+                        key: smtp-pass
+                  - name: EMAIL_FROM
+                    value: ${{ secrets.EMAIL_FROM }}
+                  - name: EMAIL_SUBJECT
+                    value: "Your ProPath Account Password"
+                  - name: EMAIL_TEMPLATE
+                    value: "password-template.hbs"
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: smtp-service
+            namespace: ${{ env.NAMESPACE }}
+          spec:
+            selector:
+              app: smtp-service
+            ports:
+            - port: 3005
+              targetPort: 3005
+          ---
+          # API Gateway
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: api-gateway
+            namespace: ${{ env.NAMESPACE }}
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: api-gateway
+            template:
+              metadata:
+                labels:
+                  app: api-gateway
+              spec:
+                containers:
+                - name: api-gateway
+                  image: notkuello/propath-backend-api-gateway:latest
+                  ports:
+                  - containerPort: 3000
+                  env:
+                  - name: PORT
+                    value: "3000"
+                  - name: PATH_MICROSERVICE_HOST
+                    value: "path-management"
+                  - name: PATH_MICROSERVICE_PORT
+                    value: "3001"
+                  - name: USER_MICROSERVICE_HOST
+                    value: "user-management"
+                  - name: USER_MICROSERVICE_PORT
+                    value: "3003"
+                  - name: AUTH_MICROSERVICE_HOST
+                    value: "auth-service"
+                  - name: AUTH_MICROSERVICE_PORT
+                    value: "3002"
+                  - name: AI_MICROSERVICE_HOST
+                    value: "ai-service"
+                  - name: AI_MICROSERVICE_PORT
+                    value: "3004"
+                  - name: SMTP_MICROSERVICE_HOST
+                    value: "smtp-service"
+                  - name: SMTP_MICROSERVICE_PORT
+                    value: "3005"
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: api-gateway
+            namespace: ${{ env.NAMESPACE }}
+          spec:
+            selector:
+              app: api-gateway
+            ports:
+            - port: 3000
+              targetPort: 3000
+            type: LoadBalancer
+          EOF
 
-          # Identify microservice directories (assuming they are top-level folders containing a Dockerfile)
-          for service_dir_raw in */; do
-            service_dir="${service_dir_raw%/}" # Remove trailing slash
-            
-            # Check if it's a real directory, contains a Dockerfile, and is not a hidden/Git folder
-            if [ -d "$service_dir" ] && [ -f "$service_dir/Dockerfile" ] && ! [[ "$service_dir" == ".git"* || "$service_dir" == ".github" ]]; then
-              echo "Processing directory: $service_dir"
+      - name: Wait for deployment
+        run: |
+          kubectl wait --for=condition=available --timeout=300s deployment/postgres -n ${{ env.NAMESPACE }}
+          kubectl wait --for=condition=available --timeout=300s deployment/path-management -n ${{ env.NAMESPACE }}
+          kubectl wait --for=condition=available --timeout=300s deployment/auth-service -n ${{ env.NAMESPACE }}
+          kubectl wait --for=condition=available --timeout=300s deployment/user-management -n ${{ env.NAMESPACE }}
+          kubectl wait --for=condition=available --timeout=300s deployment/ai-service -n ${{ env.NAMESPACE }}
+          kubectl wait --for=condition=available --timeout=300s deployment/smtp-service -n ${{ env.NAMESPACE }}
+          kubectl wait --for=condition=available --timeout=300s deployment/api-gateway -n ${{ env.NAMESPACE }}
 
-              # Check if any changed files belong to this microservice directory
-              # The grep pattern looks for lines starting with the service directory name followed by a slash
-              if echo "$CHANGED_FILES_CONTENT" | grep -q -E "^${service_dir}/"; then
-                echo "Changes detected in '$service_dir'. Proceeding with build and deploy."
-                ANY_SERVICE_PROCESSED=true
-
-                # Construct ECR image name. Assumes ECR repository name matches the service directory name.
-                ECR_IMAGE_NAME_WITH_REPO="$ECR_REGISTRY_URI/$service_dir" 
-
-                # 1. Build the Docker image
-                echo "Building Docker image for '$service_dir' with tag '$IMAGE_TAG'..."
-                docker build -t "$ECR_IMAGE_NAME_WITH_REPO:$IMAGE_TAG" "./$service_dir"
-                if [ $? -ne 0 ]; then
-                  echo "ERROR: Docker build failed for '$service_dir'."
-                  exit 1
-                fi
-
-                # 2. Push the image to ECR
-                echo "Pushing Docker image '$ECR_IMAGE_NAME_WITH_REPO:$IMAGE_TAG' to ECR..."
-                docker push "$ECR_IMAGE_NAME_WITH_REPO:$IMAGE_TAG"
-                if [ $? -ne 0 ]; then
-                  echo "ERROR: Docker push failed for '$service_dir'."
-                  exit 1
-                fi
-
-                # 3. Deploy to EKS
-                echo "Deploying '$service_dir' to EKS..."
-                
-                # Determine the path to the Kubernetes manifest file.
-                # User indicated "tengo uno por cada microservicio".
-                # Assuming the manifest is INSIDE the microservice folder and named <service-dir>.yaml, deployment.yaml, or k8s.yaml.
-                KUBE_MANIFEST_FILE=""
-                if [ -f "./$service_dir/${service_dir}.yaml" ]; then
-                  KUBE_MANIFEST_FILE="./$service_dir/${service_dir}.yaml"
-                elif [ -f "./$service_dir/deployment.yaml" ]; then
-                  KUBE_MANIFEST_FILE="./$service_dir/deployment.yaml"
-                elif [ -f "./$service_dir/k8s.yaml" ]; then # Another common option
-                  KUBE_MANIFEST_FILE="./$service_dir/k8s.yaml"
-                else
-                  echo "ERROR: Kubernetes manifest for '$service_dir' not found. Searched for ./${service_dir}/${service_dir}.yaml, ./${service_dir}/deployment.yaml, and ./${service_dir}/k8s.yaml"
-                  exit 1
-                fi
-                echo "Using manifest file: $KUBE_MANIFEST_FILE"
-
-                # Update the image tag in the Kubernetes manifest.
-                # 'yq' is recommended for robust YAML manipulation.
-                if ! command -v yq &> /dev/null; then
-                  echo "yq not found. Installing yq..."
-                  sudo wget https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -O /usr/bin/yq && sudo chmod +x /usr/bin/yq
-                fi
-                
-                TEMP_MANIFEST_FILE=$(mktemp) # Create a temporary file for the modified manifest
-                cp "$KUBE_MANIFEST_FILE" "$TEMP_MANIFEST_FILE"
-
-                # This 'yq' command assumes you want to update the image of a container named after the 'service_dir'.
-                # Or, if not found, it updates the image of the first container in the manifest.
-                # IMPORTANT! Adjust the 'yq' selector based on your manifest structure.
-                # Example: (.spec.template.spec.containers[] | select(.name == "your-container-name") .image) = "new_image_value"
-                # If the container name in your YAML is the same as 'service_dir':
-                yq_expression="(.spec.template.spec.containers[] | select(.name == \"$service_dir\") .image) |= \"$ECR_IMAGE_NAME_WITH_REPO:$IMAGE_TAG\""
-                
-                # Apply the first expression
-                yq "$yq_expression" "$TEMP_MANIFEST_FILE" > "${TEMP_MANIFEST_FILE}.modified"
-                
-                # Check if the image was updated by the first expression. If not, try the fallback.
-                if ! grep -q "$ECR_IMAGE_NAME_WITH_REPO:$IMAGE_TAG" "${TEMP_MANIFEST_FILE}.modified"; then
-                    echo "WARN: Container named '$service_dir' not found or image not updated by name. Trying to update the first container's image as a fallback."
-                    yq_expression_fallback="(.spec.template.spec.containers[0].image) = \"$ECR_IMAGE_NAME_WITH_REPO:$IMAGE_TAG\""
-                    yq "$yq_expression_fallback" "$TEMP_MANIFEST_FILE" > "${TEMP_MANIFEST_FILE}.modified" 
-                fi
-
-                # Final check to ensure the image tag was set in the temporary modified file
-                if ! grep -q "$ECR_IMAGE_NAME_WITH_REPO:$IMAGE_TAG" "${TEMP_MANIFEST_FILE}.modified"; then
-                   echo "ERROR: Failed to update image tag in manifest $KUBE_MANIFEST_FILE for '$service_dir' using both primary and fallback methods."
-                   echo "Original manifest content:"
-                   cat "$TEMP_MANIFEST_FILE"
-                   echo "Attempted modified manifest content:"
-                   cat "${TEMP_MANIFEST_FILE}.modified"
-                   rm "$TEMP_MANIFEST_FILE" "${TEMP_MANIFEST_FILE}.modified"
-                   exit 1
-                fi
-                
-                # Replace original temp file with the modified one
-                mv "${TEMP_MANIFEST_FILE}.modified" "$TEMP_MANIFEST_FILE"
-
-                echo "Applying manifest '$TEMP_MANIFEST_FILE' to EKS cluster in namespace '${{ env.K8S_NAMESPACE }}'..."
-                kubectl apply -f "$TEMP_MANIFEST_FILE" --namespace "${{ env.K8S_NAMESPACE }}"
-                if [ $? -ne 0 ]; then
-                  echo "ERROR: kubectl apply failed for '$service_dir'."
-                  rm "$TEMP_MANIFEST_FILE"
-                  exit 1
-                fi
-                rm "$TEMP_MANIFEST_FILE" # Clean up temporary file
-
-                echo "'$service_dir' deployed successfully."
-              else
-                echo "No changes detected in '$service_dir'. Skipping build and deploy."
-              fi
-              echo "----------------------------------------------------"
-            fi # End of if service_dir is a valid microservice directory
-          done # End of loop iterating through directories
-
-          if [ "$ANY_SERVICE_PROCESSED" = false ]; then
-            echo "No microservices were changed in this push that required a new build/deployment."
-          fi
+      - name: Get service info
+        run: |
+          echo "Deployment completed!"
+          kubectl get services -n ${{ env.NAMESPACE }}
+          echo "API Gateway external IP:"
+          kubectl get service api-gateway -n ${{ env.NAMESPACE }} -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
